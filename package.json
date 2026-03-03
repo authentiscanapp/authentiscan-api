@@ -4,6 +4,6 @@
   "description": "AuthentiScan Pro — Backend API",
   "private": true,
   "engines": {
-    "node": "18.x"
+    "node": "24.x"
   }
 }

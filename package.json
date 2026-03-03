@@ -1,0 +1,9 @@
+{
+  "name": "authentiscan-api",
+  "version": "1.0.0",
+  "description": "AuthentiScan Pro — Backend API",
+  "private": true,
+  "engines": {
+    "node": "18.x"
+  }
+}

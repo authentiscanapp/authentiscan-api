@@ -1,3 +1,5 @@
+import { put, del } from "@vercel/blob";
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -23,33 +25,44 @@ export default async function handler(req, res) {
     try {
       const audioBuffer = Buffer.from(audio, "base64");
 
-      // ── STEP 1: Resemble Detect — análise acústica real de voz IA ──
+      // ── STEP 1: Resemble Detect — real acoustic AI voice analysis ──
       let resembleScore = null;
       let resembleLabel = null;
       let resembleError = null;
+      let blobUrl = null;
 
       if (RESEMBLE_KEY) {
         try {
-          const formData = new FormData();
-          formData.append(
-            "audio_file",
-            new Blob([audioBuffer], { type: "audio/wav" }),
-            "audio.wav"
+          // Upload to Vercel Blob to get a public URL
+          const blob = await put(
+            `audio-scan-${Date.now()}.wav`,
+            audioBuffer,
+            { access: "public", contentType: "audio/wav" }
           );
-          formData.append("content_type", "audio");
+          blobUrl = blob.url;
+
+          // Send URL to Resemble Detect
+          const formData = new FormData();
+          formData.append("url", blobUrl);
+          formData.append("privacy_mode", "true");
 
           const resembleRes = await fetch("https://app.resemble.ai/api/v2/detect", {
             method: "POST",
             headers: {
-              Authorization: `Token token=${RESEMBLE_KEY}`,
+              Authorization: `Token ${RESEMBLE_KEY}`,
             },
             body: formData,
           });
 
+          // Delete blob immediately after sending to Resemble
+          try { await del(blobUrl); } catch (_) {}
+
           if (resembleRes.ok) {
             const rData = await resembleRes.json();
-            resembleScore = rData.score ?? rData.ai_probability ?? rData.result?.score ?? null;
-            resembleLabel = rData.label ?? rData.result?.label ?? (resembleScore > 0.5 ? "AI" : "HUMAN");
+            // Resemble returns: { item: { score: 0.87, label: "AI", ... } }
+            const item = rData.item || rData;
+            resembleScore = item.score ?? item.ai_score ?? item.ai_probability ?? null;
+            resembleLabel = item.label ?? (resembleScore > 0.5 ? "AI" : "HUMAN");
           } else {
             const errData = await resembleRes.json().catch(() => ({}));
             resembleError = errData.message || errData.error || `Resemble error ${resembleRes.status}`;
@@ -57,24 +70,22 @@ export default async function handler(req, res) {
           }
         } catch (e) {
           resembleError = e.message;
-          console.error("Resemble Detect exception:", e.message);
+          // Clean up blob if upload succeeded but detection failed
+          if (blobUrl) { try { await del(blobUrl); } catch (_) {} }
+          console.error("Resemble exception:", e.message);
         }
       } else {
         resembleError = "RESEMBLE_API_KEY not configured";
       }
 
-      // ── STEP 2: ElevenLabs STT — transcrição ──
+      // ── STEP 2: ElevenLabs STT — transcription ──
       let transcription = null;
       let transcriptionError = null;
 
       if (ELEVENLABS_KEY) {
         try {
           const elForm = new FormData();
-          elForm.append(
-            "file",
-            new Blob([audioBuffer], { type: "audio/wav" }),
-            "audio.wav"
-          );
+          elForm.append("file", new Blob([audioBuffer], { type: "audio/wav" }), "audio.wav");
           elForm.append("model_id", "scribe_v1");
 
           const elRes = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
@@ -95,7 +106,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // ── STEP 3: Resultado com dados do Resemble ──
+      // ── STEP 3: Return result with Resemble data ──
       if (resembleScore !== null) {
         const aiPct = Math.round(resembleScore * 100);
         const isAI = resembleLabel === "AI" || resembleScore > 0.5;
@@ -106,26 +117,26 @@ export default async function handler(req, res) {
           type,
           score: aiPct,
           verdict,
-          title: isAI ? "Voz Gerada por IA Detectada" : "Voz Parece Autêntica",
+          title: isAI ? "AI-Generated Voice Detected" : "Voice Appears Authentic",
           desc: isAI
-            ? `Resemble Detect identificou características acústicas de voz sintética com ${aiPct}% de confiança. A análise frame-a-frame revelou padrões associados a modelos modernos de síntese de fala.`
-            : `A análise acústica não encontrou evidências de síntese artificial. A voz apresenta características naturais com apenas ${aiPct}% de probabilidade de ser IA.`,
+            ? `Resemble Detect identified synthetic voice acoustic characteristics with ${aiPct}% confidence. Frame-by-frame analysis revealed patterns associated with modern speech synthesis models.`
+            : `Acoustic analysis found no significant evidence of artificial synthesis. The voice presents natural characteristics with only ${aiPct}% probability of being AI-generated.`,
           summary: isAI
-            ? `Áudio com alta probabilidade de ser gerado por IA (${aiPct}%).`
-            : `Áudio aparenta ser de origem humana (${100 - aiPct}% humano).`,
+            ? `Audio has high probability of being AI-generated (${aiPct}%).`
+            : `Audio appears to be of human origin (${100 - aiPct}% human).`,
           transcription: transcription ? transcription.slice(0, 300) : null,
           signals: [
             {
               name: "Voice Origin",
               desc: isAI
-                ? `Análise acústica detectou padrões de síntese artificial com ${aiPct}% de probabilidade.`
-                : `Padrões acústicos consistentes com voz humana natural (${aiPct}% probabilidade de IA).`,
+                ? `Acoustic analysis detected artificial synthesis patterns with ${aiPct}% probability. Frequencies and cadences typical of AI-generated voice.`
+                : `Acoustic patterns consistent with natural human voice. Low probability of artificial synthesis (${aiPct}% AI).`,
               pct: `${aiPct}%`,
               level: type,
             },
             {
               name: "Acoustic Analysis",
-              desc: `Modelo DETECT-3B da Resemble AI analisou ${isAI ? "artefatos de síntese neural" : "variações naturais de fala"} no sinal de áudio frame-a-frame.`,
+              desc: `Resemble AI DETECT-3B model analyzed ${isAI ? "neural synthesis artifacts" : "natural speech variations"} in the audio signal frame-by-frame.`,
               pct: `${aiPct}%`,
               level: type,
             },
@@ -134,16 +145,16 @@ export default async function handler(req, res) {
               desc: transcription
                 ? `"${transcription.slice(0, 120)}..."`
                 : transcriptionError
-                  ? `Transcrição indisponível: ${transcriptionError}`
-                  : "Adicione ELEVENLABS_API_KEY para transcrição.",
+                  ? `Transcription unavailable: ${transcriptionError}`
+                  : "Add ELEVENLABS_API_KEY to enable transcription.",
               pct: transcription ? "OK" : "N/A",
               level: transcription ? "safe" : "neutral",
             },
             {
               name: "Content Analysis",
               desc: transcription
-                ? "Transcrição disponível. Para verificação de afirmações, copie o texto e use o modo texto."
-                : "Análise acústica concluída. Transcrição necessária para verificar o conteúdo falado.",
+                ? "Transcription available. To verify spoken claims, copy the text and use text mode."
+                : "Acoustic analysis complete. Transcription required to verify spoken content.",
               pct: "N/A",
               level: "neutral",
             },
@@ -151,24 +162,24 @@ export default async function handler(req, res) {
         });
       }
 
-      // ── STEP 4: Fallback com Claude se Resemble falhou mas há transcrição ──
+      // ── STEP 4: Fallback — Resemble failed, use Claude on transcription ──
       if (transcription && transcription.trim().length > 0) {
-        const audioPrompt = `Você é verificador de fatos do AuthentiScan Pro. Analise esta transcrição de áudio. Retorne APENAS JSON válido:
+        const audioPrompt = `You are a fact-checker for AuthentiScan Pro. Analyze this audio transcription for misinformation. Return ONLY valid JSON:
 
-Transcrição: """${transcription.slice(0, 3000)}"""
+Transcription: """${transcription.slice(0, 3000)}"""
 
 {
   "type": "warn",
   "score": 50,
-  "title": "Análise de Conteúdo de Áudio",
-  "desc": "2-3 frases sobre credibilidade.",
+  "title": "Audio Content Analysis",
+  "desc": "2-3 sentences about credibility.",
   "verdict": "unverified",
-  "summary": "Uma frase com a conclusão.",
+  "summary": "One sentence conclusion.",
   "signals": [
-    {"name": "Voice Origin", "desc": "Análise acústica indisponível — RESEMBLE_API_KEY necessária", "pct": "N/A", "level": "warn"},
-    {"name": "Speech Transcription", "desc": "trecho da transcrição", "pct": "OK", "level": "safe"},
-    {"name": "Audio Integrity", "desc": "avaliação de coerência", "pct": "50%", "level": "warn"},
-    {"name": "Content Analysis", "desc": "análise das afirmações feitas", "pct": "60%", "level": "warn"}
+    {"name": "Voice Origin", "desc": "Acoustic analysis unavailable — RESEMBLE_API_KEY required", "pct": "N/A", "level": "warn"},
+    {"name": "Speech Transcription", "desc": "transcription excerpt here", "pct": "OK", "level": "safe"},
+    {"name": "Audio Integrity", "desc": "coherence evaluation", "pct": "50%", "level": "warn"},
+    {"name": "Content Analysis", "desc": "analysis of claims made", "pct": "60%", "level": "warn"}
   ]
 }`;
 
@@ -201,21 +212,21 @@ Transcrição: """${transcription.slice(0, 3000)}"""
         }
       }
 
-      // ── STEP 5: Fallback final ──
+      // ── STEP 5: Final fallback ──
       return res.status(200).json({
         type: "warn",
         score: 45,
         verdict: "unverified",
-        title: "Configuração Incompleta",
+        title: "Configuration Incomplete",
         desc: !RESEMBLE_KEY
-          ? "Adicione RESEMBLE_API_KEY no Vercel para habilitar detecção acústica real de voz IA."
-          : `Detecção falhou: ${resembleError || "Erro desconhecido"}`,
-        summary: "Configure as variáveis de ambiente para análise completa.",
+          ? "Add RESEMBLE_API_KEY and BLOB_READ_WRITE_TOKEN in Vercel to enable real acoustic AI voice detection."
+          : `Detection failed: ${resembleError || "Unknown error"}`,
+        summary: "Configure environment variables for complete analysis.",
         signals: [
-          { name: "Voice Origin", desc: RESEMBLE_KEY ? (resembleError || "Erro") : "RESEMBLE_API_KEY necessária.", pct: "N/A", level: "warn" },
-          { name: "Acoustic Analysis", desc: "Requer Resemble Detect API.", pct: "N/A", level: "warn" },
-          { name: "Speech Transcription", desc: ELEVENLABS_KEY ? (transcriptionError || "Sem fala detectada") : "ELEVENLABS_API_KEY necessária.", pct: "N/A", level: "warn" },
-          { name: "Content Analysis", desc: "Transcrição necessária.", pct: "N/A", level: "warn" },
+          { name: "Voice Origin", desc: RESEMBLE_KEY ? (resembleError || "Error") : "RESEMBLE_API_KEY required.", pct: "N/A", level: "warn" },
+          { name: "Acoustic Analysis", desc: "Requires Resemble Detect API + Vercel Blob.", pct: "N/A", level: "warn" },
+          { name: "Speech Transcription", desc: ELEVENLABS_KEY ? (transcriptionError || "No speech detected") : "ELEVENLABS_API_KEY required.", pct: "N/A", level: "warn" },
+          { name: "Content Analysis", desc: "Transcription required.", pct: "N/A", level: "warn" },
         ],
       });
 
